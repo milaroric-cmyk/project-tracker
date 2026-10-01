@@ -159,6 +159,7 @@ h1{font-family:var(--serif);font-weight:400;font-size:2.1rem;letter-spacing:-.01
     <div>
       <h1>Project schedule</h1>
       <p class="stats" id="stats"></p>
+      <p class="stats" id="syncst" hidden style="margin-top:2px"></p>
     </div>
     <div class="tools">
       <button class="btn primary" id="addTask">Add task</button>
@@ -170,6 +171,7 @@ h1{font-family:var(--serif);font-weight:400;font-size:2.1rem;letter-spacing:-.01
       </div>
       <button class="btn" id="goToday">Today</button>
       <button class="btn" id="backup">Backup</button>
+      <button class="btn" id="signout" hidden>Sign out</button>
     </div>
   </header>
 
@@ -179,9 +181,16 @@ h1{font-family:var(--serif);font-weight:400;font-size:2.1rem;letter-spacing:-.01
 <div id="modal" hidden></div>
 <div id="toast" hidden role="status"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (function(){
 'use strict';
+/* ======= SUPABASE SETTINGS =======
+   Leave both empty to use the planner on one device only (data stays in this browser).
+   To share the schedule with colleagues, paste your Supabase Project URL and anon (publishable) key between the quotes. */
+var SUPABASE_URL='';
+var SUPABASE_KEY='';
+/* ================================= */
 var KEY='gantt-planner-v1', UIKEY='gantt-planner-ui-v1';
 var COLORS=['#5F8F7B','#5F86A8','#BE9B57','#B07A86','#8479B3','#74889A'];
 var ZOOMS={week:24,month:9,quarter:3.4};
@@ -230,8 +239,10 @@ function clean(d){
 var state, ui={zoom:'week'};
 try{ state=clean(JSON.parse(localStorage.getItem(KEY))); }catch(e){ state=null; }
 if(!state){ state=sample(); }
+var base=JSON.parse(JSON.stringify(state));
 try{ var u=JSON.parse(localStorage.getItem(UIKEY)); if(u&&ZOOMS[u.zoom]) ui.zoom=u.zoom; }catch(e){}
-function save(){ try{localStorage.setItem(KEY,JSON.stringify(state))}catch(e){} }
+function saveLocal(){ try{localStorage.setItem(KEY,JSON.stringify(state))}catch(e){} }
+function save(){ saveLocal(); schedulePush(); }
 function saveUI(){ try{localStorage.setItem(UIKEY,JSON.stringify(ui))}catch(e){} }
 var gOf=function(id){return state.groups.filter(function(g){return g.id===id})[0]};
 var tOf=function(id){return state.tasks.filter(function(t){return t.id===id})[0]};
@@ -425,15 +436,16 @@ body.addEventListener('pointerdown',function(e){
 
 /* ---------- modal ---------- */
 var modal=$('#modal');
-function showModal(html,mount,wide){
+function showModal(html,mount,wide,lock){
   modal.innerHTML='<div class="dlg'+(wide?' wide':'')+'" role="dialog" aria-modal="true">'+html+'</div>';
+  modal.dataset.lock=lock?'1':'';
   modal.hidden=false;
   var d=modal.firstChild; if(mount) mount(d);
   var f=d.querySelector('input:not([type=radio]),textarea,select'); if(f) f.focus();
 }
-function closeModal(){ modal.hidden=true; modal.innerHTML=''; }
-modal.addEventListener('mousedown',function(e){ if(e.target===modal) closeModal(); });
-document.addEventListener('keydown',function(e){ if(e.key==='Escape'&&!modal.hidden) closeModal(); });
+function closeModal(){ modal.hidden=true; modal.innerHTML=''; modal.dataset.lock=''; }
+modal.addEventListener('mousedown',function(e){ if(e.target===modal&&modal.dataset.lock!=='1') closeModal(); });
+document.addEventListener('keydown',function(e){ if(e.key==='Escape'&&!modal.hidden&&modal.dataset.lock!=='1') closeModal(); });
 function twice(btn,fn,msg){
   var orig=btn.textContent, armed=false, tm;
   btn.addEventListener('click',function(){
@@ -498,7 +510,8 @@ function openTask(id,gid){
       }
       var deps=Array.prototype.map.call(d.querySelectorAll('#f-deps input:checked'),function(i){return i.value});
       var data={groupId:gv,name:name,start:s,end:e,progress:+q('#f-prog').value,note:q('#f-note').value.trim(),deps:deps};
-      if(ex) Object.assign(ex,data); else state.tasks.push(Object.assign({id:uid()},data));
+      var live=ex?tOf(ex.id):null;
+      if(live) Object.assign(live,data); else state.tasks.push(Object.assign({id:ex?ex.id:uid()},data));
       var g=gOf(gv); if(g) g.collapsed=false;
       var m=enforce();
       save(); closeModal(); render();
@@ -524,7 +537,8 @@ function openProject(id){
     function go(){
       var name=q('#p-name').value.trim(); if(!name){q('#p-err').textContent='Enter a project name.';q('#p-name').focus();return}
       var c=(d.querySelector('input[name=col]:checked')||{}).value||color;
-      if(ex){ex.name=name;ex.color=c} else state.groups.push({id:uid(),name:name,color:c,collapsed:false});
+      var lg=ex?gOf(ex.id):null;
+      if(lg){lg.name=name;lg.color=c} else state.groups.push({id:ex?ex.id:uid(),name:name,color:c,collapsed:false});
       save(); closeModal(); render();
     }
     q('#p-save').addEventListener('click',go);
@@ -559,6 +573,158 @@ function openBackup(){
   },true);
 }
 
+/* ---------- Supabase sync (only active when the two settings at the top are filled in) ---------- */
+var USE_CLOUD=!!(SUPABASE_URL&&SUPABASE_KEY&&window.supabase);
+var cloud=null,cloudOn=false,cloudVer=0,user=null,dirty=false,pushing=false,pushT=null,subscribed=false;
+var copy=function(o){return JSON.parse(JSON.stringify(o))};
+var sameJ=function(a,b){return JSON.stringify(a)===JSON.stringify(b)};
+function strip(s){
+  return {
+    groups:s.groups.map(function(g){return {id:g.id,name:g.name,color:g.color}}),
+    tasks:s.tasks.map(function(t){return {id:t.id,groupId:t.groupId,name:t.name,start:t.start,end:t.end,progress:t.progress,note:t.note,deps:t.deps.slice().sort()}}).sort(function(a,b){return a.id<b.id?-1:1})
+  };
+}
+function setStatus(k,msg){
+  if(!cloud) return;
+  var el=$('#syncst'); el.hidden=false;
+  var m={loading:'Connecting…',saving:'Saving…',saved:'All changes saved'+(user&&user.email?' · '+user.email:''),error:'Not synced: '+(msg||'check your connection')};
+  el.textContent=m[k]; el.style.color=k==='error'?'var(--danger)':'';
+}
+// Three-way merge by id: what you changed wins, everything else comes from the latest shared version.
+function mergeLists(b,l,r,norm){
+  var n=norm||function(x){return x},B={},L={},R={},seen={},out=[];
+  b.forEach(function(x){B[x.id]=x}); l.forEach(function(x){L[x.id]=x}); r.forEach(function(x){R[x.id]=x});
+  r.forEach(function(x){
+    seen[x.id]=1;
+    if(!L[x.id]){ if(!B[x.id]) out.push(x); return; }
+    if(B[x.id]&&!sameJ(n(L[x.id]),n(B[x.id]))) out.push(L[x.id]); else out.push(x);
+  });
+  l.forEach(function(x){
+    if(seen[x.id]) return;
+    if(!B[x.id]||!sameJ(n(x),n(B[x.id]))) out.push(x);
+  });
+  return out;
+}
+function mergeStates(b,l,r){
+  var gs=mergeLists(b.groups,l.groups,r.groups,function(g){return {id:g.id,name:g.name,color:g.color}});
+  var ts=mergeLists(b.tasks,l.tasks,r.tasks);
+  var gid={}; gs.forEach(function(g){gid[g.id]=1});
+  return {groups:gs,tasks:ts.filter(function(t){return gid[t.groupId]})};
+}
+function applyRemote(row){
+  var remote=clean(row.data)||{groups:[],tasks:[]};
+  var prev={}; state.groups.forEach(function(g){prev[g.id]=g});
+  if(dirty||pushing){ state=mergeStates(base,state,copy(remote)); pruneDeps(); enforce(); dirty=true; }
+  else state=remote;
+  state.groups.forEach(function(g){ if(prev[g.id]) g.collapsed=prev[g.id].collapsed; });
+  cloudVer=row.version; base=copy(remote);
+  saveLocal(); render();
+  if(dirty) schedulePush();
+}
+function schedulePush(){
+  if(!cloud||!user) return;
+  dirty=true;
+  if(!cloudOn) return;
+  clearTimeout(pushT); pushT=setTimeout(flush,350);
+}
+async function flush(){
+  if(!cloudOn||pushing||!dirty) return;
+  if(sameJ(strip(state),strip(base))){ dirty=false; setStatus('saved'); return; }
+  pushing=true; dirty=false; setStatus('saving');
+  var snap=strip(state), ver=cloudVer, res;
+  try{
+    res=await cloud.from('planner').update({data:snap,version:ver+1,updated_at:new Date().toISOString()}).eq('id','main').eq('version',ver).select('version');
+  }catch(e){ res={error:{message:'network error'}}; }
+  pushing=false;
+  if(res.error){ dirty=true; setStatus('error',res.error.message); return; }
+  if(!res.data||!res.data.length){
+    dirty=true;
+    var r=await cloud.from('planner').select('data,version').eq('id','main').maybeSingle();
+    if(r.error||!r.data){ setStatus('error',r.error&&r.error.message); return; }
+    applyRemote(r.data);
+    toast("Your changes were merged with your colleague's latest edits");
+    return;
+  }
+  cloudVer=res.data[0].version; base=copy(snap);
+  setStatus('saved');
+  if(dirty) schedulePush();
+}
+async function loadRemote(){
+  setStatus('loading');
+  var res;
+  try{ res=await cloud.from('planner').select('data,version').eq('id','main').maybeSingle(); }catch(e){ setStatus('error','network error'); return false; }
+  if(res.error){ setStatus('error',res.error.message); return false; }
+  if(!res.data){
+    var seed={groups:[],tasks:[]};
+    var ins=await cloud.from('planner').insert({id:'main',data:seed,version:1});
+    if(ins.error){
+      var r2=await cloud.from('planner').select('data,version').eq('id','main').maybeSingle();
+      if(r2.error||!r2.data){ setStatus('error',ins.error.message); return false; }
+      res=r2;
+    } else res={data:{data:seed,version:1}};
+  }
+  applyRemote(res.data);
+  cloudOn=true; setStatus('saved');
+  if(dirty) schedulePush();
+  return true;
+}
+async function refresh(){
+  if(!cloudOn||pushing) return;
+  var r; try{ r=await cloud.from('planner').select('data,version').eq('id','main').maybeSingle(); }catch(e){ return; }
+  if(r&&r.data&&r.data.version!==cloudVer) applyRemote(r.data);
+}
+function subscribe(){
+  cloud.channel('planner-main').on('postgres_changes',{event:'UPDATE',schema:'public',table:'planner',filter:'id=eq.main'},function(p){
+    var row=p.new; if(!row||pushing||row.version<=cloudVer) return;
+    applyRemote(row); toast('Schedule updated by a colleague');
+  }).subscribe();
+}
+async function startCloud(u){
+  user=u; $('#signout').hidden=false;
+  var ok=await loadRemote();
+  if(ok&&!subscribed){ subscribe(); subscribed=true; }
+}
+function openLogin(msg){
+  showModal('<h2>Sign in</h2><p class="note">Use the email and password created for you in Supabase.</p>'
+    +'<label>Email<input id="l-email" type="email" autocomplete="username"></label>'
+    +'<label>Password<input id="l-pass" type="password" autocomplete="current-password"></label>'
+    +'<p class="err" id="l-err" role="alert">'+esc(msg||'')+'</p>'
+    +'<div class="acts"><span class="sp"></span><button class="btn primary" id="l-go">Sign in</button></div>',
+  function(d){
+    var q=function(s){return $(s,d)};
+    async function go(){
+      var em=q('#l-email').value.trim(), pw=q('#l-pass').value;
+      if(!em||!pw){ q('#l-err').textContent='Enter your email and password.'; return; }
+      q('#l-go').disabled=true;
+      var r; try{ r=await cloud.auth.signInWithPassword({email:em,password:pw}); }catch(e){ r={error:{message:'Network error'}}; }
+      q('#l-go').disabled=false;
+      if(r.error){ q('#l-err').textContent=r.error.message; return; }
+      closeModal(); startCloud(r.data.user);
+    }
+    q('#l-go').addEventListener('click',go);
+    d.addEventListener('keydown',function(ev){ if(ev.key==='Enter'){ ev.preventDefault(); go(); } });
+  },false,true);
+}
+async function initCloud(){
+  if(!USE_CLOUD) return;
+  cloud=window.supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
+  var s; try{ s=await cloud.auth.getSession(); }catch(e){ setStatus('error','network error'); return; }
+  if(!s.data||!s.data.session){ openLogin(); return; }
+  startCloud(s.data.session.user);
+}
+function wake(){
+  if(!cloud||!user||document.hidden) return;
+  if(!cloudOn){ startCloud(user); return; }
+  if(dirty) schedulePush(); else refresh();
+}
+window.addEventListener('focus',wake);
+document.addEventListener('visibilitychange',wake);
+$('#signout').addEventListener('click',async function(){
+  try{ await cloud.auth.signOut(); }catch(e){}
+  try{ localStorage.removeItem(KEY); }catch(e){}
+  location.reload();
+});
+
 /* ---------- toolbar ---------- */
 $('#addTask').addEventListener('click',function(){openTask(null)});
 $('#addProject').addEventListener('click',function(){openProject(null)});
@@ -570,6 +736,7 @@ document.querySelectorAll('.seg button').forEach(function(b){
 
 render();
 scrollToToday(false);
+initCloud();
 })();
 </script>
 </body>

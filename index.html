@@ -160,7 +160,7 @@ h1{font-family:var(--serif);font-weight:400;font-size:2.1rem;letter-spacing:-.01
       <h1>Project schedule</h1>
       <p class="stats" id="stats"></p>
     </div>
-    <div id="cloudStatus" class="stats" style="margin:0 8px 0 0">☁ Local mode</div><div class="tools">
+    <div class="tools">
       <button class="btn primary" id="addTask">Add task</button>
       <button class="btn" id="addProject">Add project</button>
       <div class="seg" role="group" aria-label="Timeline scale">
@@ -179,7 +179,6 @@ h1{font-family:var(--serif);font-weight:400;font-size:2.1rem;letter-spacing:-.01
 <div id="modal" hidden></div>
 <div id="toast" hidden role="status"></div>
 
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (function(){
 'use strict';
@@ -228,93 +227,12 @@ function clean(d){
   ts.forEach(function(t){var seen={};t.deps=t.deps.filter(function(x){if(!tids[x]||x===t.id||seen[x])return false;seen[x]=1;return true})});
   return {groups:gs,tasks:ts};
 }
-/* ---------- cloud configuration ---------- */
-/*
-  1. Create a Supabase project.
-  2. Run the SQL from "Project schedule - Supabase setup.sql".
-  3. Put your Project URL and anon key below.
-*/
-var SUPABASE_URL='https://skzteyrzaoyvlgwecyso.supabase.co';
-var SUPABASE_ANON_KEY='sb_publishable_Cio7Q97RbQ-l0gD8zbuggA_LgKgcL3z';
-var CLOUD_READY=SUPABASE_URL.indexOf('PASTE_')!==0 && SUPABASE_ANON_KEY.indexOf('PASTE_')!==0;
-var sb=CLOUD_READY ? window.supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY) : null;
-if(CLOUD_READY){var cs=document.getElementById('cloudStatus');if(cs)cs.textContent='☁ Online sync';}
-var state=null, ui={zoom:'week'}, saveTimer=null, remoteTimer=null, suppressRemote=false;
-
+var state, ui={zoom:'week'};
+try{ state=clean(JSON.parse(localStorage.getItem(KEY))); }catch(e){ state=null; }
+if(!state){ state=sample(); }
 try{ var u=JSON.parse(localStorage.getItem(UIKEY)); if(u&&ZOOMS[u.zoom]) ui.zoom=u.zoom; }catch(e){}
-
+function save(){ try{localStorage.setItem(KEY,JSON.stringify(state))}catch(e){} }
 function saveUI(){ try{localStorage.setItem(UIKEY,JSON.stringify(ui))}catch(e){} }
-
-function localFallback(){
-  try{ state=clean(JSON.parse(localStorage.getItem(KEY))); }catch(e){ state=null; }
-  if(!state){ state=sample(); try{localStorage.setItem(KEY,JSON.stringify(state))}catch(e){} }
-}
-
-function save(){
-  /* Keep a local copy as a safety net, and queue a cloud save. */
-  try{localStorage.setItem(KEY,JSON.stringify(state))}catch(e){}
-  if(CLOUD_READY && !suppressRemote){
-    clearTimeout(saveTimer);
-    saveTimer=setTimeout(saveCloud,350);
-  }
-}
-
-async function saveCloud(){
-  if(!sb || !state) return;
-  try{
-    var {error}=await sb.from('project_tracker').upsert({
-      id:1,
-      data:state,
-      updated_at:new Date().toISOString()
-    });
-    if(error) throw error;
-    toast('Saved online');
-  }catch(e){
-    console.error(e);
-    toast('Could not save online. Local copy is still available.');
-  }
-}
-
-async function loadCloud(){
-  if(!sb){ localFallback(); return; }
-  try{
-    var res=await sb.from('project_tracker').select('data').eq('id',1).maybeSingle();
-    if(res.error) throw res.error;
-    if(res.data && res.data.data){
-      state=clean(res.data.data)||sample();
-      try{localStorage.setItem(KEY,JSON.stringify(state))}catch(e){}
-    }else{
-      localFallback();
-      await saveCloud();
-    }
-  }catch(e){
-    console.error(e);
-    localFallback();
-    toast('Cloud connection failed. Using local copy.');
-  }
-}
-
-function subscribeCloud(){
-  if(!sb) return;
-  sb.channel('project-tracker-live')
-    .on('postgres_changes',
-      {event:'UPDATE',schema:'public',table:'project_tracker',filter:'id=eq.1'},
-      function(payload){
-        if(!payload.new || !payload.new.data) return;
-        clearTimeout(remoteTimer);
-        remoteTimer=setTimeout(function(){
-          var incoming=clean(payload.new.data);
-          if(!incoming) return;
-          suppressRemote=true;
-          state=incoming;
-          try{localStorage.setItem(KEY,JSON.stringify(state))}catch(e){}
-          render();
-          suppressRemote=false;
-          toast('Updated from another computer');
-        },100);
-      })
-    .subscribe();
-}
 var gOf=function(id){return state.groups.filter(function(g){return g.id===id})[0]};
 var tOf=function(id){return state.tasks.filter(function(t){return t.id===id})[0]};
 var dur=function(t){return toDay(t.end)-toDay(t.start)+1};
@@ -650,11 +568,8 @@ document.querySelectorAll('.seg button').forEach(function(b){
   b.addEventListener('click',function(){ ui.zoom=b.dataset.z; saveUI(); render(); scrollToToday(false); });
 });
 
-(async function init(){
-  await loadCloud();
-  subscribeCloud();
-  render();
-  scrollToToday(false);
+render();
+scrollToToday(false);
 })();
 </script>
 </body>
